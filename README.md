@@ -11,7 +11,7 @@ From a research perspective, I’d really like to explore some ideas on the arch
 
 If you have any ideas (or H100s), let me know!
 
-Here’s a [link](www.google.com) to the blog post.
+Here’s a [link](https://neuron-by-neuron.ghost.io/g-houlish-p-retrained-t-errifier-or-training-my-own-gpt-pretraining-finetuning-rlhf-to-generate-scary-stories-for-halloween-2/) to the blog post.
 
 
 
