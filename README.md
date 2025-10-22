@@ -1,4 +1,29 @@
 # G(houlish) P(retrained) T(errifier) 🎃
+# October 2025 
+
+I made this repo when I was first getting into LLMs - following Karpathy's famous tutorial - I built a GPT model from scratch and went through pretraining, and what I would now call mid training, and tried to do some form of RL - but I didn't really know what I was doing - and I think what I ended up doing was kind of just another form of mid training. 
+
+Since then I have gotten used to doing a lot with GRPO and so I thought it would be fun to update this with a GRPO function - keeping inline with the original repo, GRPOing to tell scary stories. The way it works is there are prompts of the start of scary stories, it generates completions and GPT-4.1 Mini judges which is scarier and coherent, then this happens in a round robin style to generate the advantages, then I use a separate set of test prompts to evaluate my model vs GPT-4.1 Nano to see if any learning happens. It goes from never winning any to 26.5% of the time - I feel very pleased with this considering it's a 1.5B model I trained totally from scratch! 
+
+## GRPO Implementation Details
+
+The GRPO (Generative Reinforcement Learning with Policy Optimization) training loop works as follows:
+
+1. **Story Generation**: For each training prompt, the model generates multiple completions (default 3) using multinomial sampling with temperature 0.9
+2. **Round-Robin Competition**: Each generated story competes against every other story in the batch using GPT-4.1 Mini as a judge
+3. **Advantage Calculation**: Win rates from the competitions are converted to advantages for policy optimization
+4. **GRPO Loss**: The model is updated using a policy gradient loss weighted by the computed advantages
+5. **Evaluation**: Periodically, the model is evaluated against GPT-4.1 Nano on a separate set of evaluation prompts
+
+**Key Technical Features:**
+- **Model Architecture**: 1.5B parameter GPT with full GPT-2 structure (24 layers, 16 attention heads, 1600 embedding dimension)
+- **Training**: AdamW optimizer with learning rate scheduling and gradient clipping
+- **Precision**: bfloat16 for efficiency during both training and inference
+- **Evaluation**: Automated comparison against GPT-4.1 Nano with detailed logging of win rates and reasoning
+
+Hope this can serve as educational on how to do the entire training procedure from pretraining to mid training to RLing on a specific task! 
+
+# October 2024
 In this project, I wanted to explore building and training my own GPT-2-level LLM, inspired by [Karpathy](https://www.youtube.com/watch?v=l8pRSuU81PU). My goal was to go through all the steps—from building something really small-scale to get a feel for transformers, to running a large-scale pre-training, and finally fine-tuning with some 'light' or 'pseudo' reinforcement learning with human feedback (RLHF).
 
 I'm particularly interested in fine-tuning and RLHF for various niche domains. Since I’m releasing this on Halloween, I chose to fine-tune the model for scary stories as a fun example. But ultimately, my hope was to understand LLMs better, learn how to handle pre-training at scale, and get a sense of how fine-tuning and RLHF work—even at a smaller scale.

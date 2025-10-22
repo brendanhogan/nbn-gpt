@@ -316,7 +316,7 @@ class GPTModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
 
-def get_model(model_name: str, vocab_size: int) -> GPTModel:
+def get_model(model_name: str, vocab_size=None) -> GPTModel:
     """
     Get a preconfigured GPT model based on the specified model name.
 
