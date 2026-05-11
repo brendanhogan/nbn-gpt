@@ -337,6 +337,44 @@ class MixtureOfExperts(nn.Module):
 
 
 
+def attn_res(history: list[torch.Tensor], pseudo_query: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Full Attention Residuals (AttnRes) from the Kimi Team paper (arxiv 2603.15031).
+
+    Replaces the standard `x = x + f(x)` residual update with an attention-weighted
+    sum over ALL previous sublayer outputs. The query is a single learnable d-vector
+    per layer (initialized to zero so the attention starts as a uniform average).
+
+    Args:
+        history: list of L tensors, each shape (B, T, d). v_0 is the token embedding,
+                 v_1..v_{L-1} are previous sublayer outputs (attn or ffn).
+        pseudo_query: shape (d,). The per-layer learnable w_l vector.
+
+    Returns:
+        h: shape (B, T, d). The attention-weighted combination, used as input to the
+           next sublayer.
+        alpha: shape (L, B, T). The attention weights (saved by the caller for analysis).
+    """
+    # Iterative: never materialize a stacked V tensor. Each `history[i]` is already
+    # saved as a sublayer output (would be saved anyway for that sublayer's own
+    # backward), so the weighted sum below doesn't add new big tensors to the
+    # autograd graph. This is the only version we've found that fits in 80 GB at
+    # B=32 with full autograd active during training. Empirically ~12 s/step.
+    eps = 1e-6
+    L = len(history)
+    logits_per_item = []
+    for v in history:
+        rms = torch.sqrt(v.float().pow(2).mean(-1) + eps).to(v.dtype)                    # (B, T)
+        wv = torch.einsum('d, b t d -> b t', pseudo_query, v)                            # (B, T)
+        logits_per_item.append(wv / rms)
+    logits = torch.stack(logits_per_item, dim=0)                                          # (L, B, T) — tiny
+    alpha = F.softmax(logits.float(), dim=0).to(history[0].dtype)                         # (L, B, T)
+    h = alpha[0].unsqueeze(-1) * history[0]
+    for i in range(1, L):
+        h = h + alpha[i].unsqueeze(-1) * history[i]
+    return h, alpha
+
+
 class TransformerBlock(nn.Module):
     """Implements a full transformer block with multi-head attention and feed-forward layers."""
 
@@ -348,6 +386,7 @@ class TransformerBlock(nn.Module):
         use_moe: bool = False,
         num_experts: int = 4,
         experts_per_token: int = 2,
+        use_attn_res: bool = False,
     ) -> None:
         """
         Initialize the TransformerBlock module.
@@ -363,12 +402,18 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.multihead_attention = MultiAttentionHead(embedding_size, number_of_attention_heads, dropout_rate)
         self.use_moe = use_moe
+        self.use_attn_res = use_attn_res
         if use_moe:
             self.feed_forward_layer = MixtureOfExperts(embedding_size, num_experts, experts_per_token)
         else:
             self.feed_forward_layer = FeedForward(embedding_size, dropout_rate)
+        # AttnRes pseudo-queries (one before attention, one before FFN). Zero-init so
+        # attention starts uniform across depth — matches the paper's recommendation.
+        if use_attn_res:
+            self.attn_pseudo_query = nn.Parameter(torch.zeros(embedding_size))
+            self.ffn_pseudo_query  = nn.Parameter(torch.zeros(embedding_size))
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | float]:
+    def forward(self, x: torch.Tensor, history: list[torch.Tensor] | None = None) -> tuple[torch.Tensor, torch.Tensor | float]:
         """
         Perform the forward pass of the TransformerBlock module.
 
@@ -379,14 +424,43 @@ class TransformerBlock(nn.Module):
             output (torch.Tensor): Output tensor after attention and feed-forward layers.
             aux_loss (torch.Tensor | float): MoE load balancing loss, or 0.0 if MoE is off.
         """
-        x = x + self.multihead_attention(F.rms_norm(x, (x.size(-1),)))
-        if self.use_moe:
-            ff_out, aux_loss = self.feed_forward_layer(F.rms_norm(x, (x.size(-1),)))
-            x = x + ff_out
-            return x, aux_loss
+        if self.use_attn_res:
+            # AttnRes path: input to each sublayer comes from softmax-weighted attention
+            # over the history of all previous sublayer outputs.
+            assert history is not None, "use_attn_res=True requires history list"
+
+            # --- Attention sublayer ---
+            attn_in, attn_alpha = attn_res(history, self.attn_pseudo_query)
+            attn_out = self.multihead_attention(F.rms_norm(attn_in, (attn_in.size(-1),)))
+            history.append(attn_out)
+
+            # --- FFN / MoE sublayer ---
+            ffn_in, ffn_alpha = attn_res(history, self.ffn_pseudo_query)
+            if self.use_moe:
+                ff_out, aux_loss = self.feed_forward_layer(F.rms_norm(ffn_in, (ffn_in.size(-1),)))
+            else:
+                ff_out = self.feed_forward_layer(F.rms_norm(ffn_in, (ffn_in.size(-1),)))
+                aux_loss = 0.0
+            history.append(ff_out)
+
+            # Save alpha vectors for analysis (detached, mean over batch+seq to keep size small).
+            with torch.no_grad():
+                self.last_attn_alpha = attn_alpha.detach().mean(dim=(1, 2))   # (L_history_at_attn,)
+                self.last_ffn_alpha  = ffn_alpha.detach().mean(dim=(1, 2))     # (L_history_at_ffn,)
+
+            # The "x" return value isn't used in the AttnRes path (GPTModel reads `history` directly),
+            # but we return ff_out so the signature stays uniform.
+            return ff_out, aux_loss
         else:
-            x = x + self.feed_forward_layer(F.rms_norm(x, (x.size(-1),)))
-            return x, 0.0
+            # Standard residual path (unchanged behavior).
+            x = x + self.multihead_attention(F.rms_norm(x, (x.size(-1),)))
+            if self.use_moe:
+                ff_out, aux_loss = self.feed_forward_layer(F.rms_norm(x, (x.size(-1),)))
+                x = x + ff_out
+                return x, aux_loss
+            else:
+                x = x + self.feed_forward_layer(F.rms_norm(x, (x.size(-1),)))
+                return x, 0.0
 
 
 class GPTModel(nn.Module):
@@ -403,12 +477,14 @@ class GPTModel(nn.Module):
         num_experts: int = 4,
         experts_per_token: int = 2,
         moe_aux_loss_weight: float = 0.01,
+        use_attn_res: bool = False,
     ) -> None:
         super().__init__()
 
         self.context_length = context_length
         self.use_moe = use_moe
         self.moe_aux_loss_weight = moe_aux_loss_weight
+        self.use_attn_res = use_attn_res
 
         # Setup actual transformer blocks
         self.transformer_blocks = nn.ModuleDict(dict(
@@ -421,6 +497,7 @@ class GPTModel(nn.Module):
                     use_moe=use_moe,
                     num_experts=num_experts,
                     experts_per_token=experts_per_token,
+                    use_attn_res=use_attn_res,
                 )
                 for _ in range(number_of_transformer_layers)
             ]),
@@ -431,6 +508,10 @@ class GPTModel(nn.Module):
 
         # Share weights between first and last layer
         self.transformer_blocks.token_embedding_table.weight = self.lm_head.weight
+
+        # Final AttnRes pseudo-query (used to aggregate all sublayer outputs before LM head).
+        if use_attn_res:
+            self.final_pseudo_query = nn.Parameter(torch.zeros(input_embedding_size))
 
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, return_logits=True) -> tuple[torch.Tensor, torch.Tensor]:
@@ -443,9 +524,21 @@ class GPTModel(nn.Module):
         # Pass through transformer blocks. Each block returns its output and an aux loss
         # (the MoE load balancing loss, or 0.0 when MoE is off).
         total_aux_loss = 0.0
-        for block in self.transformer_blocks.transformers:
-            x, block_aux_loss = block(x)
-            total_aux_loss = total_aux_loss + block_aux_loss
+        if self.use_attn_res:
+            # AttnRes path: maintain a list of all sublayer outputs. Each block reads
+            # from `history` and appends its two sublayer outputs (attn, ffn).
+            history: list[torch.Tensor] = [x]
+            for block in self.transformer_blocks.transformers:
+                _, block_aux_loss = block(None, history=history)
+                total_aux_loss = total_aux_loss + block_aux_loss
+            # Final AttnRes over the full history before the LM head.
+            x, final_alpha = attn_res(history, self.final_pseudo_query)
+            with torch.no_grad():
+                self.last_final_alpha = final_alpha.detach().mean(dim=(1, 2))   # (L_history,)
+        else:
+            for block in self.transformer_blocks.transformers:
+                x, block_aux_loss = block(x)
+                total_aux_loss = total_aux_loss + block_aux_loss
 
         # Do final normalization
         x = F.rms_norm(x, (x.size(-1),))
@@ -497,6 +590,7 @@ def get_model(
     num_experts: int = 4,
     experts_per_token: int = 2,
     moe_aux_loss_weight: float = 0.01,
+    use_attn_res: bool = False,
 ) -> GPTModel:
     """
     Get a preconfigured GPT model based on the specified model name.
@@ -520,6 +614,7 @@ def get_model(
         num_experts=num_experts,
         experts_per_token=experts_per_token,
         moe_aux_loss_weight=moe_aux_loss_weight,
+        use_attn_res=use_attn_res,
     )
     if model_name.lower() == 'gpt2small':
         return GPTModel(

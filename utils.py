@@ -156,14 +156,14 @@ def evaluate_model(model: torch.nn.Module, val_loader: datasets.AbstractDataLoad
     model.eval()
     val_loader.reset()
     val_loss_accum = 0.0
-    
-    # with torch.no_grad():
-    for _ in tqdm(range(val_steps), desc="Evaluating", disable=not distributed_params['master_process']):
-        x, y = val_loader.get_batch()
-        with torch.autocast(device_type=distributed_params['device_type'], dtype=torch.bfloat16):
-            _, loss = model(x, y, return_logits=False)
-            val_loss_accum += loss.detach()
-            del loss
+
+    with torch.no_grad():
+        for _ in tqdm(range(val_steps), desc="Evaluating", disable=not distributed_params['master_process']):
+            x, y = val_loader.get_batch()
+            with torch.autocast(device_type=distributed_params['device_type'], dtype=torch.bfloat16):
+                _, loss = model(x, y, return_logits=False)
+                val_loss_accum += loss.detach()
+                del loss
 
     # If distributed average over all GPUs
     if distributed_params["running_distributed"]:
@@ -371,6 +371,80 @@ def save_routing_probe(
     val_loader.reset()
 
 
+####################
+## ATTNRES LOGGING ##
+####################
+
+def collect_attn_res_stats(raw_model: torch.nn.Module) -> Dict[str, float]:
+    """
+    Walk transformer blocks and read the alpha vectors that attn_res() saved on
+    each TransformerBlock during forward. Compute entropy of each alpha
+    distribution (lower = router making a more decisive depth pick).
+
+    No-op-style: returns {} if AttnRes isn't on (the attributes won't exist).
+    """
+    stats: Dict[str, float] = {}
+    blocks = raw_model.transformer_blocks.transformers
+    eps = 1e-9
+    for L, block in enumerate(blocks):
+        for slot in ("attn", "ffn"):
+            alpha = getattr(block, f"last_{slot}_alpha", None)
+            if alpha is None:
+                continue
+            entropy = -(alpha * (alpha + eps).log()).sum().item()
+            stats[f"attnres/layer_{L}/{slot}_entropy"]      = entropy
+            stats[f"attnres/layer_{L}/{slot}_history_size"] = int(alpha.numel())
+    final_alpha = getattr(raw_model, "last_final_alpha", None)
+    if final_alpha is not None:
+        stats["attnres/final_entropy"] = -(final_alpha * (final_alpha + eps).log()).sum().item()
+    return stats
+
+
+def save_attnres_probe(
+    val_loader: datasets.AbstractDataLoader,
+    step: int,
+    args: argparse.Namespace,
+    distributed_params: Dict[str, any],
+) -> None:
+    """
+    Run one validation batch with the model in eval mode and save the resulting
+    per-sublayer alpha vectors to step_<step>/attnres_probe.pt. This is the
+    snapshot we use to plot "which layer attends to which" heatmaps offline.
+
+    No-op if AttnRes is off or this rank isn't master.
+    """
+    if not args.use_attn_res or not distributed_params["master_process"]:
+        return
+
+    raw_model = distributed_params["raw_model"]
+    raw_model.eval()
+    val_loader.reset()
+    with torch.no_grad():
+        x, _ = val_loader.get_batch()
+        with torch.autocast(device_type=distributed_params["device_type"], dtype=torch.bfloat16):
+            _ = raw_model(x, return_logits=False)
+
+    rows = []  # list of (label, np.array)
+    blocks = raw_model.transformer_blocks.transformers
+    for L, block in enumerate(blocks):
+        for slot in ("attn", "ffn"):
+            alpha = getattr(block, f"last_{slot}_alpha", None)
+            if alpha is None:
+                continue
+            rows.append((f"L{L}_{slot}", alpha.float().cpu().numpy()))
+    final_alpha = getattr(raw_model, "last_final_alpha", None)
+    if final_alpha is not None:
+        rows.append(("final", final_alpha.float().cpu().numpy()))
+
+    save_path = os.path.join(args.output_dir, f"step_{step}", "attnres_probe.pt")
+    torch.save({
+        "step": step,
+        "rows": rows,        # list of (sublayer_label, alpha_vector). Variable length.
+    }, save_path)
+    print(f"saved AttnRes probe to {save_path}")
+    val_loader.reset()
+
+
 def resume_from_checkpoint(args: argparse.Namespace, model: torch.nn.Module, optimizers: torch.optim.Optimizer, device: torch.device, distributed_params: Dict[str, any]) -> int:
     """
     Resumes model training from the latest checkpoint if resume_training is enabled.
@@ -467,6 +541,9 @@ def save_checkpoint(model: torch.nn.Module, optimizers: torch.optim.Optimizer, v
 
     # Save MoE routing decisions on a small fixed probe of validation data (no-op if MoE off).
     save_routing_probe(val_loader, step, args, distributed_params)
+
+    # Save AttnRes alpha vectors per sublayer (no-op if AttnRes off).
+    save_attnres_probe(val_loader, step, args, distributed_params)
 
     # Evaluate on hellaswag
     ## TODO: SKIPPING HELLASWAG FOR NOW -- doesnt work with compile 
@@ -670,6 +747,10 @@ def train_model(
             moe_stats = collect_moe_stats(distributed_params['raw_model']) if args.use_moe else {}
             training_dict.update(moe_stats)
 
+            # AttnRes per-layer alpha entropy (empty dict if AttnRes off).
+            attnres_stats = collect_attn_res_stats(distributed_params['raw_model']) if args.use_attn_res else {}
+            training_dict.update(attnres_stats)
+
             # Log all metrics to W&B
             if args.use_wb_tracking:
                 wandb.log({
@@ -682,6 +763,7 @@ def train_model(
                     "train/step": step,
                     "global_step": step,
                     **moe_stats,
+                    **attnres_stats,
                 }, step=step)
             
             # Log progress

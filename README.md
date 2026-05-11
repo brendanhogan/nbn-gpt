@@ -7,7 +7,7 @@ After GRPO I wanted to keep going on this repo and try out a few newer ideas whi
 Three experiments planned, in order:
 
 1. **Mixture of Experts (MoE)** — done, write-up below.
-2. **Residual attention** — TBD, separate push.
+2. **Attention Residuals** — done, write-up below.
 3. **(Third experiment, name TBD)** — TBD, separate push.
 
 The setup for every experiment is the same controlled comparison: train a dense baseline and the modified architecture for the same number of steps on the same data on a single H100 (capped at ~2h of wall time for the dense run), then compare validation loss curves and run a deeper analysis of whatever the new mechanism is doing.
@@ -164,6 +164,96 @@ sbatch scripts/expert_ablation.sbatch      # 48-combo ablation (~10 min on 1 H10
 ```
 
 All plots land in `figs/`, the per-step training logs and routing probes are saved into `output_dense/step_*/` and `output_moe/step_*/`.
+
+---
+
+## Experiment 2 — Attention Residuals
+
+### What AttnRes is
+
+From the Kimi Team paper [Attention Residuals](https://arxiv.org/abs/2603.15031) (March 2026). The standard PreNorm transformer update `h_l = h_{l-1} + f_{l-1}(h_{l-1})` is, unrolled, a uniform-weight sum of every prior layer's output. That uniformity means residual-stream magnitude grows as O(L) with depth and dilutes each layer's contribution — which the paper argues is exactly the problem the attention mechanism solved over the sequence dimension.
+
+AttnRes does the same trick over depth. Each layer now takes a softmax-weighted aggregation of all prior sublayer outputs:
+
+```
+α_{i→l} = exp(w_l · RMSNorm(v_i)) / Σ_j exp(w_l · RMSNorm(v_j))
+h_l = Σ_{i=0}^{l-1} α_{i→l} · v_i
+```
+
+where `v_0` is the token embedding, `v_i` is the i-th sublayer output (we treat each attention block and each FFN/MoE block as its own "sublayer"), and `w_l ∈ R^d` is a per-layer learnable "pseudo-query" — **the only new parameter**, and the paper says to zero-init it so the attention is uniform at start of training. For a 12-layer model that's 12+12+1 = 25 AttnRes operations and 25 pseudo-queries (~19K extra params on top of 124M).
+
+### Implementation
+
+[`models.py`](models.py) gets a small new function `attn_res(history, pseudo_query)` and per-block pseudo-query parameters. `TransformerBlock` was already returning `(x, aux_loss)` from the MoE work; when `--use_attn_res` is on, the block reads from / appends to a shared `history: list[Tensor]` rather than carrying a running residual stream. The toggle is composable: dense, MoE alone, AttnRes alone, and MoE+AttnRes all work. The default (no flag) path is byte-identical to before.
+
+A few practical realities worth noting because they consumed real wall-clock to figure out:
+
+- **Memory at scale is tight.** Holding the full history of 25 sublayer outputs alive through the forward pass adds ~2.5 GB of bf16 activations at B=64. Combined with PyTorch saving a stacked V tensor at each of 25 calls (~16 GB extra at B=32), the H100's 80 GB doesn't have room — even at B=32 we OOM on the fp32 logits buffer for cross-entropy.
+- **The fix is B=32 + iterative attn_res** (no big stacked tensor saved for backward) + a long-latent bug fix to `evaluate_model` where `with torch.no_grad():` was commented out, causing eval to silently retain all autograd intermediates.
+- **`torch.compile` doesn't help here.** With history length varying 1→25 across the 25 calls, compile thrashes its graph cache. Disabling compile is slightly slower per op but avoids the recompile churn. `main_pretrain.py` skips compile automatically when `--use_attn_res` is set.
+- **At equal compute budget the AttnRes run is slower per step** (~12.4 s vs ~2.4 s for plain MoE at the same total tokens-per-step). The paper does this efficiently at scale with cached pipeline communication and a two-phase compute strategy. We didn't reimplement those — this is a study run, not a production run.
+
+Together those quirks meant the AttnRes run had a SLURM budget of 6 h and made it through ~1707 steps (vs 5100 for the dense/MoE runs). We get apples-to-apples val checkpoints at steps 500, 1000, 1500.
+
+### Results: loss curves
+
+![Loss curves](figs/attnres_vs_moe_loss.png)
+
+| Step | MoE val | MoE + AttnRes val | Δ |
+|---|---|---|---|
+| 0    | 15.984 | 14.779 | -1.205 |
+| 500  | 3.911  | 3.974  | +0.063 |
+| 1000 | 3.697  | 3.731  | +0.033 |
+| 1500 | 3.601  | 3.622  | +0.021 |
+
+Two patterns:
+
+1. **AttnRes starts lower at random init** (val 14.78 vs MoE's 15.98). With zero-init pseudo-queries, AttnRes is an equal-weight *average* over previous outputs rather than a sum — so the residual stream's magnitude is bounded, the random model's per-token logits are smaller, and cross-entropy lands lower. The paper notes this explicitly as one of the things AttnRes fixes about PreNorm.
+2. **AttnRes lags after warmup but the gap is shrinking fast.** +0.063 at step 500, halved to +0.033 at step 1000, halved again to +0.021 at step 1500. Linear extrapolation crosses zero somewhere around step 2500–3000. We didn't get to verify because our run was cut at 1707, but the trend is clean. The paper's scaling-law section shows AttnRes consistently below baseline at every compute budget they tested; we see something consistent with that direction if we'd kept training.
+
+### Where the depth-attention actually pays attention
+
+The headline figure from the experiment: at the final saved checkpoint (step 1500), here are the learned α weights for every (sublayer → previous-output) pair.
+
+![Attention matrix](figs/attnres_attention_matrix.png)
+
+Reading it: each row is one of the 25 AttnRes operations (12 layers' attention sublayers, 12 FFN sublayers, then the final aggregation row at the bottom). Each cell `(i, j)` is the weight that sublayer `i`'s residual input gave to previous output `j`. Cells above the diagonal are zero by construction (causal-in-depth — you can't attend to layers that haven't run yet). Cells with α ≥ 10% are labeled.
+
+A few real patterns that show up:
+
+- **The token embedding (column 0) is heavily weighted by many layers.** Early layers especially, but several middle layers too — the model wants to keep direct access to the raw token, not just whatever the previous layer transformed it into.
+- **Some sublayers attend almost entirely to one or two specific earlier sublayers** — visible as the very bright cells. The deeper-orange highlights in mid-depth show layers picking out specific intermediate representations rather than blending uniformly.
+- **The "final" row** (bottom) shows how the model aggregates everything before the LM head. It's not uniform — there's structure.
+
+The "is this layer specialized" question gets a quantitative answer from the entropy view:
+
+![Entropy evolution](figs/attnres_entropy_evolution.png)
+
+Each line is one sublayer's α distribution over training, normalized by `ln(history_size)` so that 1.0 = perfectly uniform (random init) and 0.0 = a one-hot pick. Color is the transformer block index (purple = early, yellow = late). The bold black line is the final aggregation.
+
+What this shows:
+
+- **The final aggregation (black) is the most decisive** — by step 1500 its entropy has dropped from 1.0 to about 0.4, meaning the final readout has settled on a small number of dominant sources.
+- **Late layers (yellow) drop fast.** They have the most depth to attend over and the most signal to gain from picking selectively.
+- **Early layers (purple) stay near uniform.** They don't have many sources to choose from (1-2 items in their history) so there isn't much to learn.
+
+This is the same depth-wise pattern we saw in MoE routing — *specialization concentrates in the deeper layers*.
+
+### Caveats and honest framing
+
+- This isn't a fair beat-MoE story at the budget we had. The paper's wins are at depth (54-layer models with 100K+ token contexts); our 12-layer model is the regime where the dilution problem AttnRes attacks is weakest. The trend we observed (gap shrinking) is at least consistent with AttnRes eventually catching up if trained longer, but we don't have the data to confirm.
+- Our wall-clock cost (~5× per step) is implementation overhead, not fundamental. The paper achieves <4% overhead with the optimizations we didn't reimplement.
+- The implementation lessons (memory bookkeeping, compile interactions, the `no_grad` eval bug we exposed) were the most valuable part of running this at small scale.
+
+### How to reproduce
+
+```
+sbatch scripts/pretrain_moe.sbatch          # baseline (5100 steps, ~92 min)
+sbatch scripts/pretrain_moe_attnres.sbatch  # AttnRes variant (B=32, ~12 s/step)
+.venv/bin/python plot_attnres.py            # generates the 3 plots in figs/
+```
+
+`scripts/pretrain_moe_attnres.sbatch` runs at B=32 with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and a 6 h time limit — long enough to reach val checkpoints at 500/1000/1500.
 
 ---
 
