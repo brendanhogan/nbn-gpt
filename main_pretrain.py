@@ -67,6 +67,12 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--model_save_interval", type=int, default=1000, help="Number of steps between model checkpoints")
     parser.add_argument("--val_tokens", type=int, default=10420224, help="Number of tokens to use for validation")
 
+    # Mixture of Experts (off by default — toggle with --use_moe)
+    parser.add_argument("--use_moe", action="store_true", help="Replace each FeedForward with a MixtureOfExperts")
+    parser.add_argument("--num_experts", type=int, default=4, help="Number of experts per MoE layer")
+    parser.add_argument("--experts_per_token", type=int, default=2, help="Top-k experts each token routes to")
+    parser.add_argument("--moe_aux_loss_weight", type=float, default=0.01, help="Weight for the MoE load balancing loss")
+
     parser.add_argument("--compile_model", type=bool, default=True, help="Whether to compile model using torch.compile")
     parser.add_argument("--seed", type=int, default=1994, help="Random seed for reproducibility")
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save output files")
@@ -120,7 +126,14 @@ def main() -> None:
 
     # 6. Initialize tokenizer and model 
     tokenizer = tokenizers.get_tokenizer("gpt2")
-    model = models.get_model(model_name=args.model_name, vocab_size=tokenizer.vocab_size)
+    model = models.get_model(
+        model_name=args.model_name,
+        vocab_size=tokenizer.vocab_size,
+        use_moe=args.use_moe,
+        num_experts=args.num_experts,
+        experts_per_token=args.experts_per_token,
+        moe_aux_loss_weight=args.moe_aux_loss_weight,
+    )
     model = model.cuda()
     model_size = utils.calculate_model_size(args, model)
     

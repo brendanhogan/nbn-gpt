@@ -274,6 +274,103 @@ def train_step(model: torch.nn.Module, train_loader: datasets.AbstractDataLoader
 
     return loss_accum
 
+####################
+### MOE LOGGING ##
+##################
+
+def collect_moe_stats(raw_model: torch.nn.Module) -> Dict[str, float]:
+    """
+    Walk the transformer blocks and collect MoE routing stats from each layer.
+
+    For each MoE layer, reads the `last_stats` dict that MixtureOfExperts.forward
+    set at the end of its last forward pass. Returns a flat dict of float scalars
+    keyed by `moe/layer_<L>/<stat_name>` so it can be merged into wandb / JSON logs.
+
+    Returns an empty dict if the model has no MoE layers (so it's safe to call
+    when --use_moe is off).
+
+    Args:
+        raw_model: The unwrapped GPTModel (not DDP / not torch.compile wrapped).
+
+    Returns:
+        Flat dict of {metric_name: float}.
+    """
+    stats_dict: Dict[str, float] = {}
+    for layer_idx, block in enumerate(raw_model.transformer_blocks.transformers):
+        layer_stats = getattr(block.feed_forward_layer, "last_stats", None)
+        if layer_stats is None:
+            continue
+        stats_dict[f"moe/layer_{layer_idx}/router_entropy"]  = layer_stats["router_entropy"].item()
+        stats_dict[f"moe/layer_{layer_idx}/imbalance_ratio"] = layer_stats["imbalance_ratio"].item()
+        for expert_id, frac in enumerate(layer_stats["fraction_per_expert"].tolist()):
+            stats_dict[f"moe/layer_{layer_idx}/fraction_expert_{expert_id}"] = frac
+    return stats_dict
+
+
+def save_routing_probe(
+    val_loader: datasets.AbstractDataLoader,
+    step: int,
+    args: argparse.Namespace,
+    distributed_params: Dict[str, any],
+    num_probe_batches: int = 4,
+) -> None:
+    """
+    Save which experts each token routed to, on a small fixed probe of validation data.
+
+    Runs the model forward (no grad) on `num_probe_batches` validation batches,
+    then walks each MoE layer and reads the routing decisions it stored on
+    `last_top_indices`. Saves the result to `step_<step>/routing_probe.pt` so
+    `analyze_routing.py` can post-hoc study which tokens go to which expert.
+
+    No-op if MoE is off or this rank is not the master process.
+
+    Args:
+        val_loader: Validation data loader.
+        step: Current training step (used for the output path).
+        args: Parsed CLI args.
+        distributed_params: Distributed config dict (must contain 'raw_model').
+        num_probe_batches: Number of validation batches to probe (small on purpose).
+    """
+    if not args.use_moe or not distributed_params["master_process"]:
+        return
+
+    raw_model = distributed_params["raw_model"]
+    raw_model.eval()
+    val_loader.reset()
+
+    all_token_ids = []
+    all_layer_routing = []  # one entry per probe batch: (num_layers, B, T, k)
+
+    with torch.no_grad():
+        for _ in range(num_probe_batches):
+            x, _ = val_loader.get_batch()
+            with torch.autocast(device_type=distributed_params["device_type"], dtype=torch.bfloat16):
+                _ = raw_model(x, return_logits=False)
+            layer_routing = torch.stack([
+                block.feed_forward_layer.last_top_indices
+                for block in raw_model.transformer_blocks.transformers
+            ], dim=0)  # (num_layers, B, T, k)
+            all_layer_routing.append(layer_routing.cpu())
+            all_token_ids.append(x.cpu())
+
+    routing_tensor = torch.cat(all_layer_routing, dim=1)  # (num_layers, total_B, T, k)
+    token_tensor   = torch.cat(all_token_ids, dim=0)      # (total_B, T)
+
+    save_path = os.path.join(args.output_dir, f"step_{step}", "routing_probe.pt")
+    torch.save({
+        "routing_top_indices": routing_tensor.to(torch.int8),  # num_experts < 128, fits in int8
+        "token_ids": token_tensor,
+        "step": step,
+        "num_experts": args.num_experts,
+        "experts_per_token": args.experts_per_token,
+        "num_layers": int(routing_tensor.shape[0]),
+    }, save_path)
+    print(f"saved routing probe to {save_path}")
+
+    # Reset so the next eval doesn't skip the probe batches.
+    val_loader.reset()
+
+
 def resume_from_checkpoint(args: argparse.Namespace, model: torch.nn.Module, optimizers: torch.optim.Optimizer, device: torch.device, distributed_params: Dict[str, any]) -> int:
     """
     Resumes model training from the latest checkpoint if resume_training is enabled.
@@ -367,6 +464,9 @@ def save_checkpoint(model: torch.nn.Module, optimizers: torch.optim.Optimizer, v
     # Evaluate and save validation loss
     print("evaluating val loss")
     val_loss = evaluate_model(model, val_loader, number_of_validation_steps, device, step, distributed_params)
+
+    # Save MoE routing decisions on a small fixed probe of validation data (no-op if MoE off).
+    save_routing_probe(val_loader, step, args, distributed_params)
 
     # Evaluate on hellaswag
     ## TODO: SKIPPING HELLASWAG FOR NOW -- doesnt work with compile 
@@ -545,7 +645,7 @@ def train_model(
             sched.step()
         # null the gradients
         model.zero_grad(set_to_none=True)
-        
+
         # Calculate timing and throughput metrics
         if distributed_params["master_process"]:
             torch.cuda.synchronize()
@@ -565,7 +665,11 @@ def train_model(
             training_dict['tokens_per_sec'] = tokens_per_sec
             training_dict['total_tokens_trained'] = total_tokens
             training_dict['step'] = step
-            
+
+            # MoE routing stats per layer (empty dict if MoE off — safe either way).
+            moe_stats = collect_moe_stats(distributed_params['raw_model']) if args.use_moe else {}
+            training_dict.update(moe_stats)
+
             # Log all metrics to W&B
             if args.use_wb_tracking:
                 wandb.log({
@@ -576,7 +680,8 @@ def train_model(
                     "perf/total_tokens_trained": total_tokens,
                     "time/elapsed_seconds": elapsed_time,
                     "train/step": step,
-                    "global_step": step
+                    "global_step": step,
+                    **moe_stats,
                 }, step=step)
             
             # Log progress

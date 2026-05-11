@@ -383,6 +383,12 @@ class CachedFineweb(AbstractDataLoader):
         self.current_position = self.process_rank * self.batch_size * self.sequence_length
         self.tokens = self._load_data_shard(self.files[self.current_shard])
 
+    def __len__(self) -> int:
+        """
+        Total number of batches across all shards (one shard's worth × num shards).
+        """
+        return self.total_number_of_tokens // (self.batch_size * self.sequence_length)
+
     def advance(self) -> None:
         """Advance to the next data shard and reset position."""
         self.current_shard = (self.current_shard + 1) % len(self.files)

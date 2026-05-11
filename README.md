@@ -1,4 +1,172 @@
 # G(houlish) P(retrained) T(errifier) 🎃
+
+# May 2026 update — further experiments
+
+After GRPO I wanted to keep going on this repo and try out a few newer ideas while keeping the implementation as readable as possible. The original codebase is small and dependency-light on purpose — anyone can read every file front to back in an afternoon — and I wanted these add-ons to feel the same way. Each new architecture sits behind a CLI flag so the original commands keep producing the exact same model.
+
+Three experiments planned, in order:
+
+1. **Mixture of Experts (MoE)** — done, write-up below.
+2. **Residual attention** — TBD, separate push.
+3. **(Third experiment, name TBD)** — TBD, separate push.
+
+The setup for every experiment is the same controlled comparison: train a dense baseline and the modified architecture for the same number of steps on the same data on a single H100 (capped at ~2h of wall time for the dense run), then compare validation loss curves and run a deeper analysis of whatever the new mechanism is doing.
+
+---
+
+## Experiment 1 — Mixture of Experts
+
+### What MoE is, briefly
+
+A dense transformer applies the **same** feed-forward network to every token. MoE replaces that single FFN with N small "expert" FFNs and a tiny linear "router" that, for each token, picks the top-k experts and blends their outputs. Total model parameters can stay the same (split one FFN into N smaller ones), but each token now does FFN compute on only a subset of the experts. The hope: experts specialize on different kinds of tokens, the router learns to dispatch correctly, and you get more model capacity per FLOP than dense.
+
+The standard failure mode is **router collapse** — the router learns to always pick the same expert, the others go dead, and you've just made the model worse. The standard fix is an **auxiliary load-balancing loss** added to the main objective that penalizes uneven expert utilization. We use the Switch Transformer form.
+
+### Implementation
+
+Everything lives in [`models.py`](models.py) right next to the original `FeedForward` class — the new `MixtureOfExperts` block is about 70 lines including comments. The toggle is `--use_moe` on the existing `main_pretrain.py`; the default (off) path is byte-for-byte unchanged from the October 2025 code.
+
+Config used for the experiment:
+- `gpt2small` (12 layers, 768 dim, 124M params)
+- 4 experts per layer, top-2 routing
+- Each expert's hidden size = `4d / num_experts = d`, so total FFN params equal one dense FFN — **same total parameter count as dense**
+- Switch-style aux loss with weight 0.01
+- Same hyperparameters as dense baseline: 5100 steps, total_batch_size = 524288 tokens, lr = 0.0036
+
+A note on per-step compute: with each expert at `1/N` the hidden size and top-k=2 of 4, each token does **half the FFN FLOPs of dense**. So at equal params, MoE is doing less compute per token; the experiment really asks "does the router's added flexibility make up for halved FFN compute?"
+
+Run commands:
+```
+# dense baseline
+sbatch scripts/pretrain_dense.sbatch
+
+# MoE
+sbatch scripts/pretrain_moe.sbatch
+```
+
+### Results: loss curves
+
+Both runs completed all 5100 steps on a single H100. Dense took ~92 minutes, MoE ~211 minutes (the slower MoE wall-clock is the naïve per-expert Python loop in the forward pass, not a fundamental FLOPs gap — proper kernels like MegaBlocks would close most of it).
+
+![Loss curves](figs/moe_vs_dense_loss.png)
+
+| Step | Dense val | MoE val | Δ |
+|---|---|---|---|
+| 500 | 3.926 | **3.911** | -0.015 |
+| 1000 | 3.687 | 3.697 | +0.010 |
+| 2000 | 3.517 | 3.539 | +0.022 |
+| 3000 | 3.444 | 3.470 | +0.026 |
+| 4000 | 3.374 | 3.402 | +0.028 |
+| 5099 | **3.277** | **3.311** | +0.034 |
+
+MoE was slightly ahead at step 500 then dense pulled away monotonically — final gap of +0.034 (≈1% in perplexity space). The curves are remarkably parallel through the middle of training, with the gap creeping up by about +0.001 per 500 steps. So **MoE matches dense within ~1% perplexity at exactly the same parameter count and step budget, with ~half the FFN FLOPs per token plus an aux-loss regularizer fighting the main loss**. At this scale (124M params, 2.7B tokens), the capacity-via-routing trade buys back almost — but not quite — the compute it gives up.
+
+### Routing health: balanced, never collapses
+
+The aux loss visibly works. Below: per-layer expert utilization at four snapshots through training.
+
+![Utilization evolution](figs/utilization_evolution.png)
+
+At step 0 (random init) every expert at every layer gets ~25% of the traffic — that's just random routing. After training, traffic still stays within roughly 0.15–0.41 per expert (never goes to zero, never dominates). Aux loss kept every expert active, and the router learned non-trivial routing decisions inside that balance constraint.
+
+The same story in two scalar metrics over training:
+
+![Router entropy curves](figs/router_entropy_curves.png)
+
+- **Left**: router entropy per layer over training. Lower = router making more decisive top-k picks. Late layers (yellow) drop fastest and lowest (~0.6 vs the uniform max of ln(4) ≈ 1.39), early layers (purple) stay closer to uniform. Specialization emerges most strongly in the deeper half of the network.
+- **Right**: load imbalance (max/min expert traffic). At random init a few layers are very imbalanced (>10×); within a few hundred steps the aux loss has clamped every layer to about 1.2–2.5× imbalance and held it there for the rest of training.
+
+### Where the specialization actually shows up
+
+Looking at the final checkpoint, for each (layer, expert), what are the most common tokens routed there? Mostly the same handful of high-frequency English function words show up everywhere (because they ARE everywhere), but a few experts at specific layers show real specialization:
+
+- **Layer 6 / E2** — almost exclusively punctuation/structural tokens (`.` `,` `\n` `-` `(` `:` `"` `?`)
+- **Layer 8 / E1** — copulas and auxiliaries (` is` ` be` ` are` ` was` ` has` ` will` ` been`)
+- **Layer 11 / E3** — pronouns/subjects (` it` ` that` ` I` ` you` ` we` ` they` ` he` ` who`)
+- **Layer 11 / E1** — rare/numeric/named-entity tokens (` data` ` 2012` ` 2013` ` computer` ` time` `S`)
+
+The most decisive routes at layer 11, sorted by how concentrated each token's routing is:
+
+![Token specialization](figs/token_specialization.png)
+
+Two notable patterns:
+1. Every bar is ~50/50 between **two** experts. That's because top-k=2 means each token-occurrence visits exactly 2 experts — so "decisive routing" doesn't mean one expert, it means a deterministic *pair*.
+2. At layer 11 most of the bars are dominated by the `{E0, E2}` pair (green); a smaller cluster routes through `{E1, E3}` (blue+yellow). The router has effectively partitioned the four experts into two functional pairs at this depth, with `{E0, E2}` handling function words and structural tokens, and `{E1, E3}` handling content-y/named-entity tokens.
+
+### Is the router context-aware or just a lookup table?
+
+The big question for any MoE analysis: when the SAME token type appears in different sentences, does it route to different experts? If routing depends only on token identity, the router is a fancy embedding lookup and most of the "specialization" story collapses. If routing varies with context, the router is reading semantic information from the residual stream and the experts really are doing context-sensitive work.
+
+For each token type with ≥500 occurrences in a 262K-token validation probe, I computed the entropy of its expert-pair choice across occurrences. Zero entropy = same pair every time (deterministic), high entropy = spread across pairs (context-dependent). Max possible is log2(6) ≈ 2.585 bits.
+
+![Context dependence](figs/context_dependence.png)
+
+Per-layer mean entropy across token types:
+
+| Layer | Mean entropy (bits) |
+|---|---|
+| 0 | 0.32 |
+| 3 | 0.57 |
+| 6 | 0.72 |
+| 8 | 1.05 |
+| 9 | 1.03 |
+| 10 | **1.26** |
+| 11 | 0.62 |
+
+Three things pop out:
+1. **Routing is mostly deterministic at the early layers (entropy ≈ 0.3–0.6).** The router at layer 0 is basically a fancy lookup over token embeddings — same token type → same expert pair, almost regardless of context.
+2. **Routing becomes meaningfully context-dependent in the late-middle of the network (layers 8–10, entropy ≈ 1.0–1.3).** This is where the residual stream has accumulated enough higher-level information for the same surface token to route differently in different surrounding sentences.
+3. **Layer 11 drops back to deterministic.** By the final layer the model has crystallized into a "what kind of token is this" decision; context has already been used.
+
+So the answer to "is the router context-aware?" is *yes, but mostly in a specific band of layers*. The lookup-table criticism is fair for the early layers and unfair for the deeper ones.
+
+### Token paths through the experts
+
+One more view: for a few sample sentences from the validation probe, trace each token's top-1 expert at every layer. Each row of the heatmap is a layer (0 at bottom, 11 at top), each column is a token, cell color is which of the four experts that token visited first at that layer.
+
+![Token paths](figs/token_paths.png)
+
+You can see vertical "highway" stripes — the same expert reused across many consecutive tokens — especially in the middle layers, where the router's choice is more about local syntactic context than the specific token. Late layers (top rows) look more dappled, with the choice depending more strongly on the token type. Different sentences produce visibly different path patterns, which is the picture-version of the context-dependence finding above.
+
+### Expert ablation — which experts are load-bearing?
+
+To get a direct causal handle on which experts matter, I took the trained checkpoint and, for each (layer, expert) of the 12 × 4 = 48 combinations, masked that expert's router logit to −∞ at inference (so the top-k can never pick it), then measured the val loss on a 30-batch fixed probe. The delta vs the unablated baseline tells you how load-bearing each (layer, expert) is.
+
+![Expert ablation](figs/expert_ablation.png)
+
+Baseline val_loss = 3.327 on the probe; the matrix shows the delta when each (layer, expert) is silenced one at a time. Three things stand out:
+
+1. **No dead experts.** Every single ablation hurts loss — deltas range from +0.017 to +0.071, all positive. So the aux loss didn't just keep experts active in the routing sense, it kept them genuinely contributing to the output.
+2. **Layer 0 / E0 is a major outlier** at +0.071, more than 2× the next-biggest delta. The first MoE block is leaning unusually hard on a single expert, and disabling it forces a lot of tokens into a backup routing they're not used to. The early layer is doing more of a "this token type → that expert" lookup, so removing one column of that lookup is especially painful.
+3. **A weak U-shape in depth.** Late layers (10, 11) tend to be more load-bearing than the middle band (layers 4–8), where deltas are smallest (most redundancy among the experts). The final layer is uniformly expensive to mess with — every E at layer 11 costs +0.031 to +0.036.
+
+This roughly aligns with the context-dependence picture: early layers are doing "lookup-table" routing and the lookup leans on specific experts (so ablating them really hurts), middle layers have built enough redundancy across experts that the top-k can re-route gracefully, and the final layer's routing is again specific enough that no expert is dispensable.
+
+### So what did we learn?
+
+- The simplest possible MoE (Switch-style aux loss, top-2 of 4, no kernel work) trains stably, never collapses, and matches dense within ~1% perplexity at equal params and equal steps despite using half the FFN FLOPs per token.
+- The aux loss is doing real work — at random init a few layers had >10× expert imbalance, and within a few hundred steps every layer is within ~2× of perfect balance and stays there.
+- Specialization is real but not uniform: early layers behave like a token-embedding lookup, late-middle layers (8–10) show the most context-dependent routing, and the final layer crystallizes into token-type-based decisions.
+- A few experts at specific depths show clear functional roles (punctuation, copulas, pronouns, numerics).
+- The wall-clock cost (~2.3× per step here) is a Python-loop artifact, not fundamental. Proper sparse-MoE kernels close most of that gap.
+
+### How to reproduce
+
+```
+sbatch scripts/pretrain_dense.sbatch
+sbatch scripts/pretrain_moe.sbatch
+
+# After both finish:
+.venv/bin/python plot_experiment.py        # 4 base plots
+.venv/bin/python advanced_analysis.py      # context + paths plots
+sbatch scripts/expert_ablation.sbatch      # 48-combo ablation (~10 min on 1 H100)
+.venv/bin/python advanced_analysis.py      # re-run to add ablation plot
+```
+
+All plots land in `figs/`, the per-step training logs and routing probes are saved into `output_dense/step_*/` and `output_moe/step_*/`.
+
+---
+
 # October 2025 
 
 I made this repo when I was first getting into LLMs - following Karpathy's famous tutorial - I built a GPT model from scratch and went through pretraining, and what I would now call mid training, and tried to do some form of RL - but I didn't really know what I was doing - and I think what I ended up doing was kind of just another form of mid training. 
@@ -92,6 +260,26 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True torchrun --standalone --nproc_p
 ```
 Both of these commands can also be found in `scripts/`. 
 The full set of arguments can be seen in `main_pretrain.py` - but these options train the 1.5B model to give the results I share here and in the blog. With 8 H100 GPUs this takes about 8.5 hours for me to run. 
+
+### Pre-Training: Mixture of Experts (optional)
+Pretraining can optionally swap each transformer block's `FeedForward` for a `MixtureOfExperts` block. Each MoE block has `num_experts` small FFNs and a tiny router that picks the top `experts_per_token` experts for each token. With the default config (4 experts, top-2, each expert at hidden = `4d / num_experts`), total parameters stay roughly the same as the dense baseline — the router just adds a few KB per layer. The dense path is untouched when `--use_moe` is not set, so the original commands still work byte-for-byte.
+
+To enable it, add the MoE flags:
+```
+python main_pretrain.py --dataset fineweb --total_batch_size 491520 --batch_size 12 --max_steps 15258 --learning_rate 0.0018 --warmdown_iters 4359 --model_name gpt2small --use_moe --num_experts 4 --experts_per_token 2 --moe_aux_loss_weight 0.01
+```
+
+While training, each MoE layer logs per-step stats to W&B and `training_log.json`:
+- `moe/layer_<L>/router_entropy` — low = router making decisive picks
+- `moe/layer_<L>/imbalance_ratio` — max/min of expert traffic; 1.0 is perfectly balanced
+- `moe/layer_<L>/fraction_expert_<E>` — fraction of token-slots that went to expert E
+
+At each eval interval, the model is also run on a small fixed probe of validation data and the per-token routing decisions get saved to `step_<step>/routing_probe.pt`. To inspect them:
+```
+python analyze_routing.py output/step_500/routing_probe.pt
+python analyze_routing.py output/step_500/routing_probe.pt --sample_paragraph
+```
+This prints per-layer expert utilization, the most common tokens routed to each (layer, expert), and optionally a color-coded per-token view of one paragraph.
 
 ### FineTuning 
 At this stage, I fine-tuned on the CreepyPasta dataset, which contains ~8.5 million tokens. While there’s definitely room for optimizing hyperparameters, I kept it relatively simple by halving the learning rate and training for three iterations over the entire dataset. Most of the code is still contained in `utils.py` and follows the same structure; the only real difference here is that the code expects a checkpoint to be provided.

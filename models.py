@@ -185,17 +185,21 @@ class MultiAttentionHead(nn.Module):
 class FeedForward(nn.Module):
     """A simple feed-forward network with a single hidden layer and non-linearity."""
 
-    def __init__(self, input_embedding_size: int, dropout_rate: float) -> None:
+    def __init__(self, input_embedding_size: int, dropout_rate: float, hidden_size: int | None = None) -> None:
         """
         Initialize the FeedForward module.
 
         Args:
             input_embedding_size (int): The size of the input embeddings.
             dropout_rate (float): The dropout rate to apply after the second linear layer.
+            hidden_size (int | None): Size of the hidden layer. Defaults to 4 * input_embedding_size.
+                Used by MixtureOfExperts to make each expert smaller than a dense FFN.
         """
         super().__init__()
-        self.feed_forward_layer = nn.Linear(input_embedding_size, 4 * input_embedding_size, bias=False)
-        self.feed_forward_projection = nn.Linear(4 * input_embedding_size, input_embedding_size, bias=False)
+        if hidden_size is None:
+            hidden_size = 4 * input_embedding_size
+        self.feed_forward_layer = nn.Linear(input_embedding_size, hidden_size, bias=False)
+        self.feed_forward_projection = nn.Linear(hidden_size, input_embedding_size, bias=False)
         self.feed_forward_projection.weight.data.zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -215,10 +219,136 @@ class FeedForward(nn.Module):
 
 
 
+class MixtureOfExperts(nn.Module):
+    """
+    Drop-in replacement for FeedForward.
+
+    Has `num_experts` small FFNs ("experts"). For each token, a tiny "router"
+    network picks the top `experts_per_token` experts. Each token's output is
+    a weighted blend of those experts' outputs, where the weights come from
+    the router's softmax scores.
+
+    Each expert's hidden size is (4 * embedding_size) / num_experts, so the
+    total parameter count is roughly the same as a single dense FeedForward.
+
+    Also returns an auxiliary "load balancing" loss that penalizes the router
+    for sending too many tokens to too few experts. Without this, the router
+    collapses to always picking the same expert.
+    """
+
+    def __init__(self, embedding_size: int, num_experts: int, experts_per_token: int) -> None:
+        """
+        Args:
+            embedding_size (int): Model dimension (d_model).
+            num_experts (int): Total number of experts (e.g. 4 or 8).
+            experts_per_token (int): How many experts each token routes to (top-k, usually 2).
+        """
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts_per_token = experts_per_token
+
+        # Each expert is a small FeedForward with hidden size (4 * d) / num_experts.
+        # That keeps total expert params equal to one dense FeedForward of hidden 4 * d.
+        expert_hidden_size = (4 * embedding_size) // num_experts
+        self.experts = nn.ModuleList([
+            FeedForward(embedding_size, dropout_rate=0.0, hidden_size=expert_hidden_size)
+            for _ in range(num_experts)
+        ])
+
+        # The router: a single linear layer that scores each expert for each token.
+        self.router = nn.Linear(embedding_size, num_experts, bias=False)
+
+        # For ablation experiments: if set to an integer, that expert's router logit
+        # is forced to -inf so the top-k never picks it. Default None = normal behavior.
+        self.disabled_expert: int | None = None
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x (torch.Tensor): Input of shape (batch, seq_len, embedding_size).
+
+        Returns:
+            output (torch.Tensor): Same shape as input.
+            aux_loss (torch.Tensor): Scalar load balancing loss.
+        """
+        batch_size, seq_len, embedding_size = x.shape
+
+        # Step 1: Score every expert for every token, then take softmax.
+        router_logits = self.router(x)                              # (B, T, num_experts)
+        # Ablation: mask out a disabled expert so top-k can never pick it.
+        if self.disabled_expert is not None:
+            router_logits = router_logits.clone()
+            router_logits[..., self.disabled_expert] = float("-inf")
+        router_probs = F.softmax(router_logits, dim=-1)             # (B, T, num_experts)
+
+        # Step 2: For each token, pick the top-k experts and renormalize their weights to sum to 1.
+        top_weights, top_indices = router_probs.topk(self.experts_per_token, dim=-1)
+        top_weights = top_weights / top_weights.sum(dim=-1, keepdim=True)
+        # top_weights and top_indices are both shape (B, T, k)
+
+        # Step 3: Run each expert on the tokens that picked it; blend by weight.
+        # Flatten batch and seq for easier indexing:
+        x_flat           = x.reshape(-1, embedding_size)             # (B*T, d)
+        top_indices_flat = top_indices.reshape(-1, self.experts_per_token)
+        top_weights_flat = top_weights.reshape(-1, self.experts_per_token)
+        output_flat      = torch.zeros_like(x_flat)
+
+        for expert_id, expert in enumerate(self.experts):
+            # Per-token weight assigned to this expert (0 if it wasn't in this token's top-k).
+            expert_weight_per_token = (
+                top_weights_flat * (top_indices_flat == expert_id)
+            ).sum(dim=-1, keepdim=True)                              # (B*T, 1)
+
+            # Only run the expert on tokens that actually need it.
+            chosen = expert_weight_per_token.squeeze(-1) > 0         # (B*T,)
+            if not chosen.any():
+                continue
+
+            expert_output = expert(x_flat[chosen])                   # (M, d)
+            output_flat[chosen] = output_flat[chosen] + expert_weight_per_token[chosen] * expert_output
+
+        output = output_flat.view(batch_size, seq_len, embedding_size)
+
+        # Step 4: Auxiliary load balancing loss (Switch Transformer style).
+        # Penalizes the router for assigning too much traffic AND probability to the same expert.
+        # Minimized when both are uniform across experts.
+        chosen_mass = torch.zeros_like(router_probs)                 # (B, T, num_experts)
+        chosen_mass.scatter_(-1, top_indices, top_weights)
+        fraction_per_expert  = chosen_mass.mean(dim=(0, 1))           # (num_experts,)
+        mean_prob_per_expert = router_probs.mean(dim=(0, 1))          # (num_experts,)
+        aux_loss = self.num_experts * (fraction_per_expert * mean_prob_per_expert).sum()
+
+        # Step 5: Save stats for logging and routing decisions for offline analysis.
+        # These don't affect gradients — they're just observables for us to look at.
+        with torch.no_grad():
+            eps = 1e-9
+            # Router entropy: low = decisive picks, high = uniform picks
+            router_entropy = -(router_probs * (router_probs + eps).log()).sum(dim=-1).mean()
+            self.last_stats = {
+                "fraction_per_expert": fraction_per_expert.detach(),
+                "router_entropy": router_entropy,
+                "imbalance_ratio": fraction_per_expert.max() / fraction_per_expert.clamp(min=eps).min(),
+            }
+            # Routing decisions for each token: which experts they picked.
+            # Read by save_routing_probe() at eval time for offline analysis.
+            self.last_top_indices = top_indices.detach()
+
+        return output, aux_loss
+
+
+
 class TransformerBlock(nn.Module):
     """Implements a full transformer block with multi-head attention and feed-forward layers."""
 
-    def __init__(self, embedding_size: int, number_of_attention_heads: int, dropout_rate: float) -> None:
+    def __init__(
+        self,
+        embedding_size: int,
+        number_of_attention_heads: int,
+        dropout_rate: float,
+        use_moe: bool = False,
+        num_experts: int = 4,
+        experts_per_token: int = 2,
+    ) -> None:
         """
         Initialize the TransformerBlock module.
 
@@ -226,12 +356,19 @@ class TransformerBlock(nn.Module):
             embedding_size (int): The size of the input embeddings.
             number_of_attention_heads (int): The number of attention heads to use.
             dropout_rate (float): The dropout rate to apply in various components.
+            use_moe (bool): If True, replace the FeedForward with a MixtureOfExperts.
+            num_experts (int): Number of experts when use_moe is True.
+            experts_per_token (int): Top-k experts each token routes to when use_moe is True.
         """
         super().__init__()
         self.multihead_attention = MultiAttentionHead(embedding_size, number_of_attention_heads, dropout_rate)
-        self.feed_forward_layer = FeedForward(embedding_size, dropout_rate)
+        self.use_moe = use_moe
+        if use_moe:
+            self.feed_forward_layer = MixtureOfExperts(embedding_size, num_experts, experts_per_token)
+        else:
+            self.feed_forward_layer = FeedForward(embedding_size, dropout_rate)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | float]:
         """
         Perform the forward pass of the TransformerBlock module.
 
@@ -239,30 +376,60 @@ class TransformerBlock(nn.Module):
             x (torch.Tensor): Input tensor.
 
         Returns:
-            torch.Tensor: Output tensor after applying attention and feed-forward layers.
+            output (torch.Tensor): Output tensor after attention and feed-forward layers.
+            aux_loss (torch.Tensor | float): MoE load balancing loss, or 0.0 if MoE is off.
         """
         x = x + self.multihead_attention(F.rms_norm(x, (x.size(-1),)))
-        x = x + self.feed_forward_layer(F.rms_norm(x, (x.size(-1),)))
-        return x
+        if self.use_moe:
+            ff_out, aux_loss = self.feed_forward_layer(F.rms_norm(x, (x.size(-1),)))
+            x = x + ff_out
+            return x, aux_loss
+        else:
+            x = x + self.feed_forward_layer(F.rms_norm(x, (x.size(-1),)))
+            return x, 0.0
 
 
 class GPTModel(nn.Module):
 
-    def __init__(self, vocab_size: int, input_embedding_size: int, context_length: int, number_of_transformer_layers: int, number_of_heads: int, dropout_rate: float) -> None:
+    def __init__(
+        self,
+        vocab_size: int,
+        input_embedding_size: int,
+        context_length: int,
+        number_of_transformer_layers: int,
+        number_of_heads: int,
+        dropout_rate: float,
+        use_moe: bool = False,
+        num_experts: int = 4,
+        experts_per_token: int = 2,
+        moe_aux_loss_weight: float = 0.01,
+    ) -> None:
         super().__init__()
 
         self.context_length = context_length
+        self.use_moe = use_moe
+        self.moe_aux_loss_weight = moe_aux_loss_weight
 
         # Setup actual transformer blocks
         self.transformer_blocks = nn.ModuleDict(dict(
             token_embedding_table = nn.Embedding(vocab_size, input_embedding_size),
-            transformers = nn.ModuleList([TransformerBlock(input_embedding_size, number_of_heads, dropout_rate) for _ in range(number_of_transformer_layers)]),
+            transformers = nn.ModuleList([
+                TransformerBlock(
+                    input_embedding_size,
+                    number_of_heads,
+                    dropout_rate,
+                    use_moe=use_moe,
+                    num_experts=num_experts,
+                    experts_per_token=experts_per_token,
+                )
+                for _ in range(number_of_transformer_layers)
+            ]),
         ))
 
-        # Setup final linear layer to make projection 
+        # Setup final linear layer to make projection
         self.lm_head = nn.Linear(input_embedding_size, vocab_size, bias=False)
 
-        # Share weights between first and last layer 
+        # Share weights between first and last layer
         self.transformer_blocks.token_embedding_table.weight = self.lm_head.weight
 
 
@@ -270,28 +437,35 @@ class GPTModel(nn.Module):
         batch_size, sequence_length = idx.shape
         # B, T = idx.shape
 
-        # Get token and position embedding 
-        x = self.transformer_blocks.token_embedding_table(idx) # batch size x sequence length x embedding size 
+        # Get token and position embedding
+        x = self.transformer_blocks.token_embedding_table(idx) # batch size x sequence length x embedding size
 
-        # Pass through transformer blocks
+        # Pass through transformer blocks. Each block returns its output and an aux loss
+        # (the MoE load balancing loss, or 0.0 when MoE is off).
+        total_aux_loss = 0.0
         for block in self.transformer_blocks.transformers:
-            x = block(x)
-        
+            x, block_aux_loss = block(x)
+            total_aux_loss = total_aux_loss + block_aux_loss
+
         # Do final normalization
         x = F.rms_norm(x, (x.size(-1),))
 
-        # Output depends if loss and/or logists are needed 
+        # Output depends if loss and/or logists are needed
         if targets is not None:
-            # Then we need to calcualte loss 
+            # Then we need to calcualte loss
             logits = self.lm_head(x)
-            logits = logits.float() 
+            logits = logits.float()
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # If MoE is on, average aux loss across layers and add it to main loss.
+            # If MoE is off, total_aux_loss is just 0.0 and this line is a no-op.
+            if self.use_moe:
+                loss = loss + self.moe_aux_loss_weight * (total_aux_loss / len(self.transformer_blocks.transformers))
         else:
-            # Only do final layer for last token 
-            # logits = self.lm_head(x[:, [-1], :]) 
+            # Only do final layer for last token
+            # logits = self.lm_head(x[:, [-1], :])
             logits = self.lm_head(x)
 
-            logits = logits.float() 
+            logits = logits.float()
             loss = None
 
         if not return_logits:
@@ -316,13 +490,24 @@ class GPTModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
 
-def get_model(model_name: str, vocab_size=None) -> GPTModel:
+def get_model(
+    model_name: str,
+    vocab_size=None,
+    use_moe: bool = False,
+    num_experts: int = 4,
+    experts_per_token: int = 2,
+    moe_aux_loss_weight: float = 0.01,
+) -> GPTModel:
     """
     Get a preconfigured GPT model based on the specified model name.
 
     Args:
         model_name (str): The name of the model configuration (currently only supports 'gpt2').
         vocab_size (int): The size of the vocabulary.
+        use_moe (bool): If True, replace each FeedForward with a MixtureOfExperts.
+        num_experts (int): Number of experts per MoE layer.
+        experts_per_token (int): Top-k experts each token routes to.
+        moe_aux_loss_weight (float): Weight for the MoE load balancing loss.
 
     Returns:
         GPTModel: A preconfigured GPT model.
@@ -330,6 +515,12 @@ def get_model(model_name: str, vocab_size=None) -> GPTModel:
     Raises:
         ValueError: If an unsupported model name is provided.
     """
+    moe_kwargs = dict(
+        use_moe=use_moe,
+        num_experts=num_experts,
+        experts_per_token=experts_per_token,
+        moe_aux_loss_weight=moe_aux_loss_weight,
+    )
     if model_name.lower() == 'gpt2small':
         return GPTModel(
             vocab_size=50304, # make rounder number
@@ -338,6 +529,7 @@ def get_model(model_name: str, vocab_size=None) -> GPTModel:
             number_of_transformer_layers=12,
             number_of_heads=6,
             dropout_rate=0.1,
+            **moe_kwargs,
         )
     elif model_name.lower() == 'gpt2full':
         return GPTModel(
@@ -347,6 +539,7 @@ def get_model(model_name: str, vocab_size=None) -> GPTModel:
             number_of_transformer_layers=52,
             number_of_heads=12,
             dropout_rate=0.1,
+            **moe_kwargs,
         )
     else:
         raise ValueError(f"Unsupported model name: {model_name}")
