@@ -76,6 +76,10 @@ def get_args() -> argparse.Namespace:
     # Attention Residuals (off by default — toggle with --use_attn_res)
     parser.add_argument("--use_attn_res", action="store_true", help="Replace standard residuals with Full AttnRes (Kimi paper)")
 
+    # Adaptive depth — per-token softmax over layer depths with a compute-cost penalty.
+    parser.add_argument("--use_adaptive_depth", action="store_true", help="Per-token soft routing over the L layer outputs")
+    parser.add_argument("--adaptive_depth_cost_weight", type=float, default=0.01, help="λ weighting the expected-depth penalty")
+
     parser.add_argument("--compile_model", type=bool, default=True, help="Whether to compile model using torch.compile")
     parser.add_argument("--seed", type=int, default=1994, help="Random seed for reproducibility")
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save output files")
@@ -137,6 +141,8 @@ def main() -> None:
         experts_per_token=args.experts_per_token,
         moe_aux_loss_weight=args.moe_aux_loss_weight,
         use_attn_res=args.use_attn_res,
+        use_adaptive_depth=args.use_adaptive_depth,
+        adaptive_depth_cost_weight=args.adaptive_depth_cost_weight,
     )
     model = model.cuda()
     model_size = utils.calculate_model_size(args, model)
@@ -180,6 +186,8 @@ def main() -> None:
     extra_adamw_params = list(raw_model.lm_head.parameters()) + transformer_params_1d
     if args.use_attn_res:
         extra_adamw_params.append(raw_model.final_pseudo_query)
+    if args.use_adaptive_depth:
+        extra_adamw_params.extend(raw_model.depth_router.parameters())
 
     optimizer1 = torch.optim.AdamW(extra_adamw_params, lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
     optimizer2 = muon.Muon(transformer_params_2d, lr=0.1*args.learning_rate, momentum=0.95, distributed_params=distributed_params)

@@ -170,3 +170,4 @@ slurm_logs/
 # Claude Code session state
 .claude/
 output_moe_attnres/
+output_moe_adaptive_depth/

@@ -8,7 +8,7 @@ Three experiments planned, in order:
 
 1. **Mixture of Experts (MoE)** — done, write-up below.
 2. **Attention Residuals** — done, write-up below.
-3. **(Third experiment, name TBD)** — TBD, separate push.
+3. **Adaptive depth** (per-token soft routing over layer outputs, with a compute-cost penalty) — done, write-up below.
 
 The setup for every experiment is the same controlled comparison: train a dense baseline and the modified architecture for the same number of steps on the same data on a single H100 (capped at ~2h of wall time for the dense run), then compare validation loss curves and run a deeper analysis of whatever the new mechanism is doing.
 
@@ -254,6 +254,125 @@ sbatch scripts/pretrain_moe_attnres.sbatch  # AttnRes variant (B=32, ~12 s/step)
 ```
 
 `scripts/pretrain_moe_attnres.sbatch` runs at B=32 with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and a 6 h time limit — long enough to reach val checkpoints at 500/1000/1500.
+
+---
+
+## Experiment 3 — Adaptive depth (per-token soft routing over layer outputs)
+
+### What this is
+
+After the MoE and AttnRes experiments, the natural next step felt like: *not all tokens need the same amount of computation*. Function words like ` the` or `\n` probably need much less depth than rare/content tokens like ` quantum` or ` 2013`. Chain-of-thought got around this by spending more *tokens* on hard reasoning, but you could imagine letting a single forward pass spend more *depth* on harder tokens.
+
+The version implemented here is the **soft, no-early-exit** flavor — call it adaptive *readout* depth:
+
+```
+token_embedding[t] ──► depth_router (Linear: d → L=12) ──► softmax → α[t, 1..L]
+
+   token_embedding[t]  →  Layer 1, Layer 2, ..., Layer 12   (all run as normal)
+                                                            
+   final[t] = Σ_k α[t, k] · h^k[t]    ──► RMSNorm ──► LM head
+
+   loss = cross_entropy + λ · mean_over_tokens( Σ_k k · α[t, k] )
+```
+
+- A tiny `Linear(d → L)` reads only the **token embedding** (no positional info, no deep features) and predicts a softmax over the L=12 layer depths.
+- All 12 layers still run in parallel — this is the cheap variant where the KV-cache problem is sidestepped because every token is "present" at every depth.
+- The final prediction for each token is a **weighted sum of every layer's output** for that token.
+- A cost penalty `λ · expected_depth` pushes the router toward shallower readouts.
+
+This is essentially "AttnRes's final aggregation, but with an input-dependent query (the router) instead of a per-layer learned vector, and with an explicit compute-cost loss term." It's also closely related to **Mixture-of-Depths** (Raposo et al, 2024), which makes a similar per-token compute decision but uses a hard top-k cap per layer instead of a soft global softmax over depths.
+
+### Implementation
+
+Branched off the AttnRes setup so it composes with `--use_moe` (but **not** with `--use_attn_res` — guarded against in the constructor). New code:
+
+- [`models.py`](models.py): `nn.Linear(d, L)` depth router on `GPTModel`. Forward stacks all L layer outputs and takes the per-token softmax-weighted sum. `loss += λ · mean(expected_depth)`.
+- [`main_pretrain.py`](main_pretrain.py): `--use_adaptive_depth` and `--adaptive_depth_cost_weight` flags. Router params get routed to AdamW (they're outside `transformer_blocks.transformers`, which is Muon's domain).
+- [`utils.py`](utils.py): `collect_adaptive_depth_stats()` logs per-step mean expected depth, per-layer α, router entropy. `save_adaptive_depth_probe()` saves `(token_ids, depth_alpha)` at every eval interval — the data behind the per-token plots below.
+
+Memory cost is small: stacking 12 layer outputs into one `(B, T, 12, d)` tensor is ~1.2 GB at B=64, fits comfortably alongside MoE activations. Compute is ~20% slower per step than vanilla MoE (~2.9 s vs 2.4 s), so the full 5100-step run completes in **~4h** on a single H100.
+
+### Run config
+
+```
+sbatch scripts/pretrain_moe_adaptive_depth.sbatch
+```
+
+Same MoE hyperparameters as the baseline (gpt2small, 12 layers, 4 experts top-2, 5100 steps, B=64), plus `--use_adaptive_depth --adaptive_depth_cost_weight 0.01`.
+
+### Results: loss curves
+
+![Loss curves](figs/adaptive_depth_vs_moe_loss.png)
+
+Final val loss:
+
+| Step | MoE | MoE + AD | Δ |
+|---|---|---|---|
+| 500 | 3.911 | 3.965 | +0.054 |
+| 1000 | 3.697 | 3.734 | +0.037 |
+| 2000 | 3.539 | 3.568 | +0.029 |
+| 3000 | 3.470 | 3.497 | +0.027 |
+| 4000 | 3.402 | 3.428 | +0.026 |
+| 5000 | 3.314 | 3.335 | +0.021 |
+| **5099** | **3.311** | **3.331** | **+0.020** |
+
+**MoE + adaptive depth finishes only +0.020 nat (≈0.6 % perplexity) behind full-depth MoE.** Gap shrinks monotonically through training. That's a more interesting number once you see what the router actually did:
+
+### What the router learned
+
+![Alpha evolution](figs/adaptive_depth_alpha_evolution.png)
+
+The depth-router **collapses to "use mostly layer 1" within ~500 steps** and stays there:
+
+- At init: α uniform across all 12 layers ⇒ mean expected depth = 6.5 (uniform mean)
+- By step 500: mean expected depth ≈ 2.5; L1 already has ~60% of the weight
+- By step 5099: `α_L1 = 0.943`, `α_L12 = 0.058`, every other layer ~0. **Mean expected depth = 1.61.**
+
+Reading the heatmap: the left edge is uniform (yellow band across all rows), and almost immediately a single bright row at L1 dominates while everything in between (L2-L11) goes black. L12 keeps a faint persistent stripe — apparently a useful "deep correction" channel even when most of the signal comes from L1.
+
+So the model, given the choice, did **not** keep using all 12 layers. It learned to:
+1. Push the router toward the shallowest possible readout (driven by the λ=0.01 cost penalty),
+2. **Adapt the layers themselves** so that layer 1 carries most of the predictive signal,
+3. Use layer 12 as a small refinement (~5–10% weight).
+
+The +0.020 final-loss penalty is the price of doing nearly all the work in layer 1.
+
+### Per-token analysis: which tokens want which depth?
+
+Even inside the collapse, the router *does* differentiate between tokens. Below are the tokens whose mean α gives the **most** and **least** weight to layer 12 at the final checkpoint:
+
+![Per-token depth distribution](figs/adaptive_depth_per_token.png)
+
+The signal is small (everything is dominated by L1) but **interpretable**:
+
+- **Most L12 weight** — numeric/named-entity-ish tokens (` 2012`), suffixes/possessives (`'s`, `s`, `"s`), structurally-flexible content tokens (` of`, ` on`, ` for`, ` to`, `)`). These are tokens where the *meaning* depends on what came before in the sentence.
+- **Least L12 weight** (pure L1) — pure function words and punctuation: ` the`, ` a`, ` and`, ` is`, ` are`, ` will`, `:`, `,`, `\n`, ` (`. These are basically context-free — the layer-1 representation of "this token is `the`" carries all the prediction signal you need.
+
+This matches the pattern in the AttnRes analysis (deeper layers do context-dependent work; surface tokens settle at shallow). With a different λ — or a more careful schedule — the router could probably maintain a richer per-token distribution rather than collapsing so hard.
+
+### What the experiment did and didn't show
+
+What it *did* show:
+
+- **Adaptive readout depth + cost penalty actually works** as a training mechanism, with no special tricks (no Gumbel-softmax, no straight-through estimator, no reinforcement). The cost-penalized softmax is differentiable end-to-end and trains stably.
+- **The model has spare depth capacity.** At our 12-layer / 124M-param scale, the network can re-route to using mostly the first layer and pay <1% perplexity. Whether that's a property of this small model specifically or holds at scale is the obvious follow-up.
+- **Per-token differentiation is small but real and matches semantic intuition**: function words vs content/numeric tokens prefer different depths.
+
+What it *didn't* show, but would be the natural next experiments:
+
+- **λ sweep.** With λ=0 the router would settle near max depth (no compute pressure). With smaller λ we'd see a less aggressive collapse and probably more interesting per-token spread. We did one λ.
+- **Hard early-exit (Version B).** This run still runs all 12 layers — the compute savings are *theoretical*. To actually save compute you'd need to gate the forward pass and handle the KV-cache for tokens that exited shallow (CALM, LayerSkip, Mixture-of-Depths style). Doable, much more invasive.
+- **Bigger λ → see how far we can push the perplexity for compute trade.** With λ=0.05 maybe expected depth drops to 1.0 (pure L1) — what's the perplexity cost then?
+
+### How to reproduce
+
+```
+sbatch scripts/pretrain_moe.sbatch                  # baseline MoE
+sbatch scripts/pretrain_moe_adaptive_depth.sbatch   # MoE + adaptive depth (~4h)
+.venv/bin/python plot_adaptive_depth.py             # generates the 3 plots in figs/
+```
+
+All routing decisions per validation token are saved to `output_moe_adaptive_depth/step_*/depth_probe.pt` for offline analysis.
 
 ---
 

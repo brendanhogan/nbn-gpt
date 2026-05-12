@@ -445,6 +445,64 @@ def save_attnres_probe(
     val_loader.reset()
 
 
+######################
+## DEPTH-ROUTER LOG ##
+######################
+
+def collect_adaptive_depth_stats(raw_model: torch.nn.Module) -> Dict[str, float]:
+    """
+    Read the depth router's softmax stats that GPTModel.forward stashed after the
+    last forward pass. Returns a flat dict suitable for merging into training_log
+    JSON / wandb. Empty when adaptive depth is off.
+    """
+    stats: Dict[str, float] = {}
+    alpha = getattr(raw_model, "last_depth_alpha", None)
+    if alpha is None:
+        return stats
+    stats["depth/mean_expected_depth"] = raw_model.last_expected_depth.item()
+    for k, p in enumerate(alpha.tolist(), start=1):
+        stats[f"depth/alpha_layer_{k}"] = p
+    # Entropy of the depth distribution averaged over the alpha-vector.
+    eps = 1e-9
+    stats["depth/router_entropy"] = -(alpha * (alpha + eps).log()).sum().item()
+    return stats
+
+
+def save_adaptive_depth_probe(
+    val_loader: datasets.AbstractDataLoader,
+    step: int,
+    args: argparse.Namespace,
+    distributed_params: Dict[str, any],
+) -> None:
+    """
+    Save per-token depth-router output on a fixed probe batch of validation data.
+    `depth_probe.pt` stores (token_ids, alpha) so the offline analyzer can do the
+    "which tokens prefer shallow vs deep" plot. No-op if adaptive depth is off.
+    """
+    if not args.use_adaptive_depth or not distributed_params["master_process"]:
+        return
+
+    raw_model = distributed_params["raw_model"]
+    raw_model.eval()
+    val_loader.reset()
+    with torch.no_grad():
+        x, _ = val_loader.get_batch()
+        with torch.autocast(device_type=distributed_params["device_type"], dtype=torch.bfloat16):
+            _ = raw_model(x, return_logits=False)
+
+    alpha = getattr(raw_model, "last_depth_alpha_per_token", None)
+    if alpha is None:
+        return
+    save_path = os.path.join(args.output_dir, f"step_{step}", "depth_probe.pt")
+    torch.save({
+        "step": step,
+        "token_ids": x.cpu(),                    # (B, T)
+        "depth_alpha": alpha.float().cpu(),      # (B, T, L)
+    }, save_path)
+    print(f"saved adaptive-depth probe to {save_path}")
+    val_loader.reset()
+
+
 def resume_from_checkpoint(args: argparse.Namespace, model: torch.nn.Module, optimizers: torch.optim.Optimizer, device: torch.device, distributed_params: Dict[str, any]) -> int:
     """
     Resumes model training from the latest checkpoint if resume_training is enabled.
@@ -546,6 +604,9 @@ def save_checkpoint(model: torch.nn.Module, optimizers: torch.optim.Optimizer, v
 
     # Save AttnRes alpha vectors per sublayer (no-op if AttnRes off).
     save_attnres_probe(val_loader, step, args, distributed_params)
+
+    # Save per-token depth-router probabilities (no-op if adaptive depth off).
+    save_adaptive_depth_probe(val_loader, step, args, distributed_params)
 
     # Evaluate on hellaswag
     ## TODO: SKIPPING HELLASWAG FOR NOW -- doesnt work with compile 
@@ -771,6 +832,10 @@ def train_model(
             attnres_stats = collect_attn_res_stats(distributed_params['raw_model']) if args.use_attn_res else {}
             training_dict.update(attnres_stats)
 
+            # Adaptive-depth router stats (mean expected depth, alpha per layer, entropy).
+            depth_stats = collect_adaptive_depth_stats(distributed_params['raw_model']) if args.use_adaptive_depth else {}
+            training_dict.update(depth_stats)
+
             # Log all metrics to W&B
             if args.use_wb_tracking:
                 wandb.log({
@@ -784,6 +849,7 @@ def train_model(
                     "global_step": step,
                     **moe_stats,
                     **attnres_stats,
+                    **depth_stats,
                 }, step=step)
             
             # Log progress

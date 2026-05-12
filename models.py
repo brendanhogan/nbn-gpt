@@ -478,13 +478,20 @@ class GPTModel(nn.Module):
         experts_per_token: int = 2,
         moe_aux_loss_weight: float = 0.01,
         use_attn_res: bool = False,
+        use_adaptive_depth: bool = False,
+        adaptive_depth_cost_weight: float = 0.01,
     ) -> None:
         super().__init__()
+        if use_adaptive_depth and use_attn_res:
+            raise ValueError("--use_adaptive_depth is not composable with --use_attn_res in this implementation")
 
         self.context_length = context_length
         self.use_moe = use_moe
         self.moe_aux_loss_weight = moe_aux_loss_weight
         self.use_attn_res = use_attn_res
+        self.use_adaptive_depth = use_adaptive_depth
+        self.adaptive_depth_cost_weight = adaptive_depth_cost_weight
+        self.number_of_transformer_layers = number_of_transformer_layers
 
         # Setup actual transformer blocks
         self.transformer_blocks = nn.ModuleDict(dict(
@@ -513,6 +520,13 @@ class GPTModel(nn.Module):
         if use_attn_res:
             self.final_pseudo_query = nn.Parameter(torch.zeros(input_embedding_size))
 
+        # Adaptive-depth router: per-token softmax over the L layer outputs. Reads only
+        # the token embedding (no positional info / no deep features), so the router has
+        # to learn "how much computation does this TOKEN TYPE deserve". Output of layer k
+        # is then weighted by alpha[token, k] and summed before the LM head.
+        if use_adaptive_depth:
+            self.depth_router = nn.Linear(input_embedding_size, number_of_transformer_layers, bias=False)
+
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, return_logits=True) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length = idx.shape
@@ -536,9 +550,32 @@ class GPTModel(nn.Module):
             with torch.no_grad():
                 self.last_final_alpha = final_alpha.detach().mean(dim=(1, 2))   # (L_history,)
         else:
+            # If adaptive-depth is on, predict the per-token depth distribution NOW
+            # (from the raw token embedding, before any block runs) and collect every
+            # layer's output as we go. Otherwise the loop is just the standard path.
+            if self.use_adaptive_depth:
+                depth_logits = self.depth_router(x)                                 # (B, T, L)
+                depth_alpha  = F.softmax(depth_logits, dim=-1)                       # (B, T, L)
+                layer_outputs: list[torch.Tensor] = []
+
             for block in self.transformer_blocks.transformers:
                 x, block_aux_loss = block(x)
                 total_aux_loss = total_aux_loss + block_aux_loss
+                if self.use_adaptive_depth:
+                    layer_outputs.append(x)
+
+            if self.use_adaptive_depth:
+                # Stack layer outputs and take per-token weighted sum over depth.
+                stacked = torch.stack(layer_outputs, dim=2)                          # (B, T, L, d)
+                x = torch.einsum('btl, btld -> btd', depth_alpha, stacked)           # (B, T, d)
+                # Expected depth (1-indexed: depth=1 means "used layer 1's output").
+                depths = torch.arange(1, len(layer_outputs) + 1, device=x.device, dtype=depth_alpha.dtype)
+                expected_depth = (depth_alpha * depths).sum(dim=-1)                  # (B, T)
+                # Stash for logging / analysis.
+                with torch.no_grad():
+                    self.last_depth_alpha    = depth_alpha.detach().mean(dim=(0, 1)) # (L,)
+                    self.last_expected_depth = expected_depth.detach().mean()
+                    self.last_depth_alpha_per_token = depth_alpha.detach()           # (B, T, L) — saved for probes
 
         # Do final normalization
         x = F.rms_norm(x, (x.size(-1),))
@@ -553,6 +590,12 @@ class GPTModel(nn.Module):
             # If MoE is off, total_aux_loss is just 0.0 and this line is a no-op.
             if self.use_moe:
                 loss = loss + self.moe_aux_loss_weight * (total_aux_loss / len(self.transformer_blocks.transformers))
+            # Adaptive-depth cost: penalize the model for using more layers per token.
+            # `expected_depth` is the mean depth (in {1..L}) the router chose across all tokens
+            # in the batch. With λ=0 the model will collapse to using depth L; as λ grows
+            # the model trades main_loss for cheaper "average depth".
+            if self.use_adaptive_depth:
+                loss = loss + self.adaptive_depth_cost_weight * expected_depth.mean()
         else:
             # Only do final layer for last token
             # logits = self.lm_head(x[:, [-1], :])
@@ -591,6 +634,8 @@ def get_model(
     experts_per_token: int = 2,
     moe_aux_loss_weight: float = 0.01,
     use_attn_res: bool = False,
+    use_adaptive_depth: bool = False,
+    adaptive_depth_cost_weight: float = 0.01,
 ) -> GPTModel:
     """
     Get a preconfigured GPT model based on the specified model name.
@@ -615,6 +660,8 @@ def get_model(
         experts_per_token=experts_per_token,
         moe_aux_loss_weight=moe_aux_loss_weight,
         use_attn_res=use_attn_res,
+        use_adaptive_depth=use_adaptive_depth,
+        adaptive_depth_cost_weight=adaptive_depth_cost_weight,
     )
     if model_name.lower() == 'gpt2small':
         return GPTModel(
