@@ -473,16 +473,18 @@ def resume_from_checkpoint(args: argparse.Namespace, model: torch.nn.Module, opt
     # number of times. 
 
     if args.resume_training:
-        # Find the highest step directory with a checkpoint
-        step_dirs = [d for d in os.listdir(args.output_dir) if d.startswith("step_")]
-        if not step_dirs:
+        # Find the highest step directory that ACTUALLY has a checkpoint.pt
+        # (every step has its own dir for training_log.json, but only
+        # model_save_interval=1000 steps save the model+optimizer state).
+        step_dirs_with_ckpt = [
+            d for d in os.listdir(args.output_dir)
+            if d.startswith("step_") and os.path.exists(os.path.join(args.output_dir, d, "checkpoint.pt"))
+        ]
+        if not step_dirs_with_ckpt:
             raise ValueError("No checkpoint found for resuming training.")
-        
-        latest_step_dir = max(step_dirs, key=lambda x: int(x.split("_")[1]))
+
+        latest_step_dir = max(step_dirs_with_ckpt, key=lambda x: int(x.split("_")[1]))
         checkpoint_path = os.path.join(args.output_dir, latest_step_dir, "checkpoint.pt")
-        
-        if not os.path.exists(checkpoint_path):
-            raise ValueError(f"Checkpoint file not found in {checkpoint_path}")
         
         try:
             checkpoint = torch.load(checkpoint_path, map_location=distributed_params['device'])
@@ -687,19 +689,37 @@ def train_model(
         None
     """
     # Initialize the starting step
+    start_step = 0
     if args.resume_training:
         start_step = resume_from_checkpoint(args, model, optimizers, device, distributed_params)
+        # Advance the LR schedulers to match the resumed step. LambdaLR maintains
+        # an internal counter that drives the lambda; without this, training would
+        # restart at the step-0 LR (warmup) even though the model is at step N.
+        for sched in schedulers:
+            for _ in range(start_step):
+                sched.step()
 
     # Record training start time
     if distributed_params['master_process']:
         torch.cuda.synchronize()
         distributed_params['training_start_time'] = time.time()
 
-    # Initialize training loader 
+    # Initialize training loader
     train_loader.reset()
 
-    # Step through iteration steps 
-    for step in range(args.max_steps):
+    # Fast-forward through the training data already consumed by the resumed-from
+    # checkpoint. Each completed training step pulled `grad_accum_steps` batches,
+    # so call get_batch that many times to align the data ordering with the
+    # original run. Each call is just a buffer slice (with the occasional shard
+    # load), so this is cheap.
+    if start_step > 0 and distributed_params['master_process']:
+        batches_to_skip = start_step * grad_accum_steps
+        print(f"Fast-forwarding train_loader by {batches_to_skip} batches to match resumed step {start_step}...")
+        for _ in range(batches_to_skip):
+            train_loader.get_batch()
+
+    # Step through iteration steps
+    for step in range(start_step, args.max_steps):
 
         # Initialize training metrics dictionary
         training_dict = {}
