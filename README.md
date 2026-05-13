@@ -2,15 +2,30 @@
 
 # May 2026 update — further experiments
 
-After GRPO I wanted to keep going on this repo and try out a few newer ideas while keeping the implementation as readable as possible. The original codebase is small and dependency-light on purpose — anyone can read every file front to back in an afternoon — and I wanted these add-ons to feel the same way. Each new architecture sits behind a CLI flag so the original commands keep producing the exact same model.
+After GRPO I wanted to keep going on this repo and try out a few newer architectural ideas while keeping the implementation as readable as possible. The original codebase is small and dependency-light on purpose — anyone can read every file front to back in an afternoon — and I wanted these add-ons to feel the same way. Every new architecture sits behind a CLI flag so the original commands keep producing the exact same model. Default behavior is byte-for-byte unchanged.
 
-Three experiments planned, in order:
+Three experiments, all done:
 
-1. **Mixture of Experts (MoE)** — done, write-up below.
-2. **Attention Residuals** — done, write-up below.
-3. **Adaptive depth** (per-token soft routing over layer outputs, with a compute-cost penalty) — done, write-up below.
+1. **Mixture of Experts (MoE)** — replace each FFN with `N` small expert FFNs + a learned router. Same total parameters, half the FFN FLOPs per token. Aux load-balancing loss prevents router collapse.
+2. **Attention Residuals (AttnRes)** — from a [March 2026 Kimi Team paper](https://arxiv.org/abs/2603.15031). Replace standard PreNorm residuals with a softmax over all prior sublayer outputs, controlled by a per-layer learnable pseudo-query.
+3. **Adaptive depth** — a tiny linear `depth router` reads the token embedding and produces a softmax over the 12 layer depths; each token's final prediction is the per-token weighted sum of every layer's output. A compute-cost penalty `λ · expected_depth` is added to the loss so the model is rewarded for picking shallow when it can.
 
-The setup for every experiment is the same controlled comparison: train a dense baseline and the modified architecture for the same number of steps on the same data on a single H100 (capped at ~2h of wall time for the dense run), then compare validation loss curves and run a deeper analysis of whatever the new mechanism is doing.
+The setup for every experiment is the same controlled comparison: train a dense baseline and the modified architecture for the **same 5100 steps** on the **same FineWeb data** on a **single H100**, then compare validation loss curves and run a deeper analysis of whatever the new mechanism is doing.
+
+### Headline result
+
+![All three loss curves](figs/all_three_loss_curves.png)
+
+| Run | Final val loss (step 5099) | Δ vs MoE | Notable behavior |
+|---|---|---|---|
+| **Dense baseline** | **3.277** | -0.034 | Best loss, simplest architecture |
+| **MoE** | **3.311** | — | Same params, ~half FFN FLOPs |
+| **MoE + AttnRes** | **3.321** | +0.011 | Gap shrinks monotonically through training; depth-attention shows real per-layer specialization |
+| **MoE + adaptive depth** | **3.331** | +0.020 | **Router collapses to "use mostly layer 1"**; model adapts by learning to do most of the work in layer 1; achieves nearly full perplexity using ~1.6 layers on average |
+
+The most interesting finding is the adaptive-depth one: with a small compute-cost penalty, **the depth router doesn't learn an "easy vs hard token" balance — it learns to push everything into layer 1**, and the model goes along with it. Layer 12 keeps a small (~5–10 %) residual channel for refinement. Net result: only +0.020 nat (~1 % perplexity) worse than full-depth MoE while using essentially one layer's worth of representational depth at readout time. The per-token analysis still shows real variation (numeric/named-entity tokens want slightly more L12; pure function words want pure L1) — but the bulk of the story is the collapse.
+
+The AttnRes story is the cleanest "this works": gap closes from +0.063 at step 500 to **+0.011 at step 5099**, never crossing the baseline but tightening monotonically. At this scale (12 layers) the paper's depth-dilution problem isn't sharp enough to give a clear win, but the trend is in the right direction and the per-layer α heatmap shows clearly interpretable depth-wise attention patterns.
 
 ---
 
@@ -325,13 +340,13 @@ Final val loss:
 | 5000 | 3.314 | 3.335 | +0.021 |
 | **5099** | **3.311** | **3.331** | **+0.020** |
 
-**MoE + adaptive depth finishes only +0.020 nat (≈0.6 % perplexity) behind full-depth MoE.** Gap shrinks monotonically through training. That's a more interesting number once you see what the router actually did:
+**MoE + adaptive depth finishes only +0.020 nat (≈0.6 % perplexity) behind full-depth MoE.** Gap shrinks monotonically through training. That number is misleadingly tame on its own — the interesting story is *how* the model got there:
 
-### What the router learned
+### What the router learned: it learned to use layer 1
 
 ![Alpha evolution](figs/adaptive_depth_alpha_evolution.png)
 
-The depth-router **collapses to "use mostly layer 1" within ~500 steps** and stays there:
+This was the most surprising thing in the whole set of experiments. The depth-router **collapses to "use mostly layer 1" within ~500 steps** and stays there:
 
 - At init: α uniform across all 12 layers ⇒ mean expected depth = 6.5 (uniform mean)
 - By step 500: mean expected depth ≈ 2.5; L1 already has ~60% of the weight
@@ -339,12 +354,9 @@ The depth-router **collapses to "use mostly layer 1" within ~500 steps** and sta
 
 Reading the heatmap: the left edge is uniform (yellow band across all rows), and almost immediately a single bright row at L1 dominates while everything in between (L2-L11) goes black. L12 keeps a faint persistent stripe — apparently a useful "deep correction" channel even when most of the signal comes from L1.
 
-So the model, given the choice, did **not** keep using all 12 layers. It learned to:
-1. Push the router toward the shallowest possible readout (driven by the λ=0.01 cost penalty),
-2. **Adapt the layers themselves** so that layer 1 carries most of the predictive signal,
-3. Use layer 12 as a small refinement (~5–10% weight).
+The headline isn't really that the router "chose" shallow — it's that **the model rearranged itself to make shallow the right choice**. With the cost penalty making depth expensive, the cheapest way to keep loss low is to compute the useful prediction as early as possible. So during training, the layers themselves shifted: layer 1 went from "first half-step of computation" to "the layer that produces the answer." Layers 2-11 still run (this is the soft / all-layers-on-the-forward-pass version) but their outputs get downweighted into oblivion by the router. Layer 12 kept a small dedicated residual channel for whatever refinement layer 1 couldn't capture.
 
-The +0.020 final-loss penalty is the price of doing nearly all the work in layer 1.
+The +0.020 final-loss penalty is what the model pays to make this trade. Tuning λ would slide along a curve: smaller λ → more layers in play, smaller penalty; bigger λ → even more collapse to L1, possibly bigger penalty. We ran one λ.
 
 ### Per-token analysis: which tokens want which depth?
 
