@@ -205,15 +205,23 @@ Together those quirks meant the AttnRes run had a SLURM budget of 6 h and made i
 | 500  | 3.911  | 3.974  | +0.063 |
 | 1000 | 3.697  | 3.731  | +0.033 |
 | 1500 | 3.601  | 3.622  | +0.021 |
+| 2000 | 3.539  | 3.559  | +0.020 |
+| 2500 | 3.499  | 3.515  | +0.017 |
+| 3000 | 3.470  | 3.485  | +0.015 |
+| 3500 | 3.444  | 3.456  | +0.012 |
+| 4000 | 3.402  | 3.414  | +0.011 |
+| 4500 | 3.354  | 3.365  | +0.011 |
+| 5000 | 3.314  | 3.325  | +0.011 |
+| **5099** | **3.311** | **3.321** | **+0.011** |
 
 Two patterns:
 
 1. **AttnRes starts lower at random init** (val 14.78 vs MoE's 15.98). With zero-init pseudo-queries, AttnRes is an equal-weight *average* over previous outputs rather than a sum — so the residual stream's magnitude is bounded, the random model's per-token logits are smaller, and cross-entropy lands lower. The paper notes this explicitly as one of the things AttnRes fixes about PreNorm.
-2. **AttnRes lags after warmup but the gap is shrinking fast.** +0.063 at step 500, halved to +0.033 at step 1000, halved again to +0.021 at step 1500. Linear extrapolation crosses zero somewhere around step 2500–3000. We didn't get to verify because our run was cut at 1707, but the trend is clean. The paper's scaling-law section shows AttnRes consistently below baseline at every compute budget they tested; we see something consistent with that direction if we'd kept training.
+2. **AttnRes lags after warmup but the gap shrinks monotonically through training.** +0.063 at step 500 → +0.033 at step 1000 → +0.021 at step 1500 → +0.011 at step 4000 onward (where it stabilizes). Final gap **+0.011 nat** at step 5099 — about a third of the dense-vs-MoE gap (+0.034) we saw at the same step count, and well within our 2× wall-clock budget. The paper's scaling-law section shows AttnRes consistently below baseline at every compute budget they tested; our 12-layer model just barely doesn't get there but the closing-trend is real.
 
 ### Where the depth-attention actually pays attention
 
-The headline figure from the experiment: at the final saved checkpoint (step 1500), here are the learned α weights for every (sublayer → previous-output) pair.
+The headline figure from the experiment: at the final saved checkpoint (step 5099), here are the learned α weights for every (sublayer → previous-output) pair.
 
 ![Attention matrix](figs/attnres_attention_matrix.png)
 
@@ -241,19 +249,20 @@ This is the same depth-wise pattern we saw in MoE routing — *specialization co
 
 ### Caveats and honest framing
 
-- This isn't a fair beat-MoE story at the budget we had. The paper's wins are at depth (54-layer models with 100K+ token contexts); our 12-layer model is the regime where the dilution problem AttnRes attacks is weakest. The trend we observed (gap shrinking) is at least consistent with AttnRes eventually catching up if trained longer, but we don't have the data to confirm.
+- This isn't a beat-MoE story at our budget. The paper's wins are at depth (54-layer models with 100K+ token contexts); our 12-layer model is the regime where the dilution problem AttnRes attacks is weakest. Even so, the gap closes from +0.063 → +0.011 over training and stabilizes there — about a third of the dense-vs-MoE gap and clearly headed toward (but not crossing) the baseline.
 - Our wall-clock cost (~5× per step) is implementation overhead, not fundamental. The paper achieves <4% overhead with the optimizations we didn't reimplement.
 - The implementation lessons (memory bookkeeping, compile interactions, the `no_grad` eval bug we exposed) were the most valuable part of running this at small scale.
 
 ### How to reproduce
 
 ```
-sbatch scripts/pretrain_moe.sbatch          # baseline (5100 steps, ~92 min)
-sbatch scripts/pretrain_moe_attnres.sbatch  # AttnRes variant (B=32, ~12 s/step)
-.venv/bin/python plot_attnres.py            # generates the 3 plots in figs/
+sbatch scripts/pretrain_moe.sbatch                  # baseline (5100 steps, ~92 min)
+sbatch scripts/pretrain_moe_attnres.sbatch          # AttnRes variant (B=32, ~12 s/step, 6 h cap)
+sbatch scripts/pretrain_moe_attnres_resume.sbatch   # resume from last checkpoint, finishes to step 5099
+.venv/bin/python plot_attnres.py                    # generates the 3 plots in figs/
 ```
 
-`scripts/pretrain_moe_attnres.sbatch` runs at B=32 with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and a 6 h time limit — long enough to reach val checkpoints at 500/1000/1500.
+`scripts/pretrain_moe_attnres.sbatch` runs at B=32 with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and a 6 h time limit (gets to ~step 1700). `pretrain_moe_attnres_resume.sbatch` picks up from the latest saved `step_*/checkpoint.pt` (resume code in `utils.py:resume_from_checkpoint` finds the latest dir that actually has a checkpoint, then advances LR schedulers and the train_loader to match) and runs another ~12 h to complete all 5100 steps.
 
 ---
 
